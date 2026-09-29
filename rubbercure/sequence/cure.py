@@ -19,6 +19,7 @@ from ..mold.mapping import SensorMapBook
 from ..mold.registry import MoldRegistry
 from ..press.press import CuringPress
 from ..press.transitions import PressPhase
+from ..steam.ramp import RampBook
 from ..temp.read import read_mold_temp
 from ..timer.curve import CurveBook
 from ..timer.start import start_cure
@@ -68,6 +69,7 @@ class CureSequence:
     maps: SensorMapBook
     curves: CurveBook
     press: CuringPress
+    ramps: RampBook | None = None
     last_confirmation: dict = field(default_factory=dict)
     recorder: SequenceRecorder = field(init=False)
 
@@ -117,7 +119,15 @@ class CureSequence:
         )
 
         press.transition(PressPhase.HEATING)
-        steam = press.steam.open_steam(plan.target_kpa)
+        pressure_ramp = self.ramps.get(profile.product_code) if self.ramps is not None else None
+        initial_target = (
+            pressure_ramp.stages[0].target_kpa
+            if pressure_ramp is not None
+            else plan.target_kpa
+        )
+        steam = press.steam.open_steam(initial_target)
+        if pressure_ramp is not None:
+            press.steam.start_pressure_ramp(pressure_ramp, mold_id=plan.mold_id)
         self.recorder.note(
             "steam_open",
             "steam",
@@ -163,9 +173,9 @@ class CureSequence:
             confirmed=press.temp_loop.is_confirmed(),
         )
         press.transition(PressPhase.CURING)
-        return self.report(plan, warmup)
+        return self.report(plan, warmup, pressure_ramp)
 
-    def report(self, plan: CureRunPlan, warmup: dict) -> dict:
+    def report(self, plan: CureRunPlan, warmup: dict, pressure_ramp=None) -> dict:
         """汇总本次硫化执行情况。"""
 
         return {
@@ -174,6 +184,7 @@ class CureSequence:
             "violations": verify_order(self.recorder.names(), CURE_ORDER),
             "trace": self.recorder.as_list(),
             "warmup": warmup,
+            "pressure_ramp": pressure_ramp.as_dict() if pressure_ramp is not None else None,
             "timer": self.press.timer.snapshot(),
         }
 

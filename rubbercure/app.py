@@ -32,6 +32,7 @@ from .sequence.dispatch import DispatchSequence
 from .sequence.openmold import OpenSequence
 from .sequence.selfcheck import verify_topology
 from .sequence.stop import StopSequence
+from .steam.ramp import RampBook
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
 from .telemetry import TrendBuffer
@@ -42,6 +43,7 @@ from .timer.latch import CureLatch
 DEFAULT_UNIT = "shop1"
 DEFAULT_PRESS_ID = "press-01"
 REFERENCE_TEMPERATURE_C = 30.0
+THICK_PRODUCT_CODE = "RB-310"
 
 
 @dataclass(frozen=True)
@@ -84,24 +86,49 @@ class Platform:
         self.registry = MoldRegistry()
         self.maps = SensorMapBook()
         self.curves = CurveBook()
+        self.ramps = RampBook()
         self.latch = CureLatch()
         self.fleet = PressFleet.from_config(
             self.clock, self.bus, self.store.root, self.config
         )
         self.scheduler = BatchScheduler(self.bus, self.config.batch, self.curves)
         self._seed_reference_curve()
+        self._seed_reference_ramps()
 
         self._cycles = 0
         self._lock = threading.RLock()
         self._register_namespaces()
 
     def _seed_reference_curve(self) -> None:
-        """登记一份出厂参考曲线，供默认制品型号直接投产。"""
+        """登记出厂参考曲线，供默认制品与厚件制品直接投产。"""
 
         self.curves.register(
             self.config.press.default_product_code,
             self.config.timer.default_nominal_s,
             self.clock.now(),
+        )
+        # 厚件制品：芯部导热慢，标称硫化时长更长。
+        self.curves.register(
+            THICK_PRODUCT_CODE,
+            self.config.timer.default_nominal_s * 1.4,
+            self.clock.now(),
+        )
+
+    def _seed_reference_ramps(self) -> None:
+        """按制品登记出厂分段压力曲线：薄件低压多段缓升，厚件高压带台阶。"""
+
+        now = self.clock.now()
+        # RB-215：薄件，低压起步、三段缓升，每段停够时间再往上走。
+        self.ramps.register(
+            self.config.press.default_product_code,
+            ((260.0, 30.0), (450.0, 40.0), (640.0, 60.0)),
+            now,
+        )
+        # RB-310：厚件，芯部导热慢，中段加一道保压台阶，末段顶到更高压力。
+        self.ramps.register(
+            THICK_PRODUCT_CODE,
+            ((240.0, 40.0), (400.0, 60.0), (560.0, 60.0), (700.0, 90.0)),
+            now,
         )
 
     def _register_namespaces(self) -> None:
@@ -244,6 +271,7 @@ class Platform:
                 maps=self.maps,
                 curves=self.curves,
                 press=self.press(press_id),
+                ramps=self.ramps,
             )
             report = sequence.run(plan)
             report["topology_missing"] = sequence.verify_topology(self.topology)
@@ -456,6 +484,7 @@ class Platform:
             "molds": summarize_molds(self.registry),
             "sensor_maps": self.maps.snapshot(),
             "curves": self.curves.snapshot(),
+            "pressure_ramps": self.ramps.snapshot(),
             "latch": self.latch.snapshot(),
             "fleet": summarize_fleet(self.fleet),
             "scheduler": self.scheduler.snapshot(),

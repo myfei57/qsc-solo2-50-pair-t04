@@ -82,6 +82,7 @@ def test_config_rejects_missing_section_and_bad_window(tmp_path):
                 "target_pressure_kpa": 700.0,
                 "min_pressure_kpa": 80.0,
                 "max_pressure_kpa": 500.0,
+                "stage_arrival_tolerance_kpa": 15.0,
                 "safe_residual_kpa": 12.0,
                 "purge_hold_s": 20.0,
                 "purge_token_max_age_s": 180.0,

@@ -112,6 +112,7 @@ class SteamLimits:
     target_pressure_kpa: float
     min_pressure_kpa: float
     max_pressure_kpa: float
+    stage_arrival_tolerance_kpa: float
     safe_residual_kpa: float
     purge_hold_s: float
     purge_token_max_age_s: float
@@ -125,6 +126,9 @@ class SteamLimits:
             target_pressure_kpa=_number(section, "target_pressure_kpa", minimum=0.0),
             min_pressure_kpa=_number(section, "min_pressure_kpa", minimum=0.0),
             max_pressure_kpa=_number(section, "max_pressure_kpa", minimum=0.0),
+            stage_arrival_tolerance_kpa=_number(
+                section, "stage_arrival_tolerance_kpa", minimum=0.1
+            ),
             safe_residual_kpa=_number(section, "safe_residual_kpa", minimum=0.0),
             purge_hold_s=_number(section, "purge_hold_s", minimum=0.0),
             purge_token_max_age_s=_number(section, "purge_token_max_age_s", minimum=1.0),
@@ -148,6 +152,7 @@ class SteamLimits:
             "target_pressure_kpa": self.target_pressure_kpa,
             "min_pressure_kpa": self.min_pressure_kpa,
             "max_pressure_kpa": self.max_pressure_kpa,
+            "stage_arrival_tolerance_kpa": self.stage_arrival_tolerance_kpa,
             "safe_residual_kpa": self.safe_residual_kpa,
             "purge_hold_s": self.purge_hold_s,
             "purge_token_max_age_s": self.purge_token_max_age_s,
@@ -356,6 +361,7 @@ def default_config() -> PlatformConfig:
             target_pressure_kpa=640.0,
             min_pressure_kpa=80.0,
             max_pressure_kpa=760.0,
+            stage_arrival_tolerance_kpa=15.0,
             safe_residual_kpa=12.0,
             purge_hold_s=20.0,
             purge_token_max_age_s=180.0,

@@ -3,6 +3,7 @@
 from .header import SteamHeader
 from .pressure import PressureRegulator
 from .purge import PurgeToken, purge_cavity
+from .ramp import PressureRamp, PressureStage, RampBook, RampPhase, RampRunner
 from .sequence import close_steam, open_steam
 from .setpoint import SetpointArbiter, SetpointOutcome, SetpointRequest
 from .state import SteamPhase, SteamStateMachine
@@ -16,6 +17,11 @@ __all__ = [
     "PressureRegulator",
     "PurgeToken",
     "purge_cavity",
+    "PressureRamp",
+    "PressureStage",
+    "RampBook",
+    "RampPhase",
+    "RampRunner",
     "close_steam",
     "open_steam",
     "SetpointArbiter",

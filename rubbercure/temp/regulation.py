@@ -60,7 +60,7 @@ class TempLoop:
         with self._lock:
             measured = reading.average_c()
             correction = self.controller.update(measured, self.limits.setpoint_c, dt)
-            target_kpa = self.steam.limits.target_pressure_kpa + correction
+            target_kpa = self.steam.ramp_target_kpa() + correction
             self.steam.submit_setpoint(self.controller_name, target_kpa, self.priority)
             outcome = self.steam.arbiter.resolve()
         band = band_summary(measured, self.limits.setpoint_c, self.limits.tolerance_c)

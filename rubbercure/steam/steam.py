@@ -11,11 +11,13 @@ import threading
 
 from ..clock import Clock
 from ..config import SteamLimits
+from ..errors import SequenceError
 from ..eventbus import Event, EventBus
 from ..store.jsonfile import JsonStore
 from .header import SteamHeader
 from .pressure import PressureRegulator
 from .purge import PurgeToken, purge_cavity
+from .ramp import PressureRamp, RampRunner
 from .sequence import close_steam, open_steam
 from .setpoint import SetpointArbiter
 from .state import SteamPhase, SteamStateMachine
@@ -24,6 +26,8 @@ from .valve import SteamValve
 from .vent import VentToken, vent_pressure
 
 STATE_KEY = "steam_state"
+RAMP_WRITER = "pressure_ramp"
+RAMP_PRIORITY = 80
 
 
 class SteamUnit:
@@ -51,6 +55,9 @@ class SteamUnit:
         )
         self.regulator = PressureRegulator(
             kp=0.09, ki=0.02, output_min=0.0, output_max=100.0
+        )
+        self.ramp = RampRunner(
+            tolerance_kpa=limits.stage_arrival_tolerance_kpa, bus=bus
         )
         self._purge_token: PurgeToken | None = None
         self._vent_token: VentToken | None = None
@@ -119,10 +126,31 @@ class SteamUnit:
 
         return open_steam(self, self._bus, target_kpa)
 
-    def close_steam(self) -> dict:
-        """按"先蒸汽、后疏水"停汽。"""
+    def start_pressure_ramp(self, pressure_ramp: PressureRamp, mold_id: str = "") -> dict:
+        """升温段挂上按制品登记的分段压力曲线，由段序接管目标压力。"""
 
-        return close_steam(self, self._bus)
+        if self._state.phase is not SteamPhase.HEATING:
+            raise SequenceError(
+                f"只有升温段才能启动分段压力曲线，当前相位 {self._state.phase.value}",
+                component="steam",
+            )
+        for stage in pressure_ramp.stages:
+            self.limits.clamp_pressure(stage.target_kpa)
+        return self.ramp.start(pressure_ramp, mold_id=mold_id)
+
+    def ramp_target_kpa(self) -> float:
+        """分段曲线当前段目标；段序未驱动时回落到配置里的单一目标。"""
+
+        if self.ramp.is_driving():
+            return self.ramp.current_target_kpa()
+        return self.limits.target_pressure_kpa
+
+    def close_steam(self) -> dict:
+        """按"先关蒸汽、后关疏水"停汽。"""
+
+        result = close_steam(self, self._bus)
+        self.ramp.drop()
+        return result
 
     def submit_setpoint(self, writer: str, target_kpa: float, priority: int) -> None:
         """由一个写入方提交压力目标值。"""
@@ -130,7 +158,23 @@ class SteamUnit:
         self.arbiter.request(writer, target_kpa, priority, reason=f"writer={writer}")
 
     def advance(self, dt: float) -> dict:
-        """推进一个控制周期：结算目标值、调节阀位、母管充压。"""
+        """推进一个控制周期：段序结算、目标值仲裁、调节阀位、母管充压。"""
+
+        ramp_view = None
+        if self.ramp.is_driving():
+            pressure = self.header.pressure_kpa
+            ramp_view = self.ramp.step(pressure, dt)
+            stage_index = ramp_view.get("stage_index", 0)
+            if ramp_view.get("receded") or ramp_view.get("advanced"):
+                self.regulator.reset()
+            self.arbiter.request(
+                RAMP_WRITER,
+                self.ramp.current_target_kpa() if self.ramp.is_driving() else pressure,
+                RAMP_PRIORITY,
+                reason=(
+                    f"stage={stage_index}" if self.ramp.is_driving() else "ramp_complete"
+                ),
+            )
 
         outcome = self.arbiter.resolve()
         if self.valve.opening_pct <= 0.0 and self._state.phase is SteamPhase.HEATING:
@@ -146,6 +190,7 @@ class SteamUnit:
             "pressure_kpa": round(pressure, 3),
             "valve_opening_pct": round(self.valve.opening_pct, 2),
             "trap_opening_pct": round(self.trap.opening_pct, 2),
+            "ramp": ramp_view or {"active": False, "phase": self.ramp.phase.value},
         }
 
     def persist_state(self) -> str:
@@ -153,6 +198,7 @@ class SteamUnit:
 
         snapshot = self._state.snapshot()
         snapshot["pressure_kpa"] = round(self.header.pressure_kpa, 4)
+        snapshot["ramp"] = self.ramp.snapshot()
         snapshot["revision"] = len(snapshot["history"])
         digest = self._store.write(STATE_KEY, snapshot)
         self._bus.publish(
@@ -170,6 +216,9 @@ class SteamUnit:
         pressure = snapshot.get("pressure_kpa")
         if isinstance(pressure, (int, float)):
             self.header.relax_toward(float(pressure), 1.0)
+        ramp_snapshot = snapshot.get("ramp")
+        if isinstance(ramp_snapshot, dict):
+            self.ramp.restore(ramp_snapshot)
         return True
 
     def snapshot(self) -> dict:
@@ -183,6 +232,7 @@ class SteamUnit:
                 "arbiter": self.arbiter.snapshot(),
                 "arbiter_decisions": self.arbiter.decisions(10),
                 "regulator": self.regulator.snapshot(),
+                "ramp": self.ramp.snapshot(),
                 "purged": self.is_purged(),
                 "vented": self.is_vented(),
             }
