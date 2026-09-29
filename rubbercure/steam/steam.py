@@ -11,19 +11,30 @@ import threading
 
 from ..clock import Clock
 from ..config import SteamLimits
+from ..errors import SteamError
 from ..eventbus import Event, EventBus
 from ..store.jsonfile import JsonStore
 from .header import SteamHeader
 from .pressure import PressureRegulator
+from .profile import RampProfile
 from .purge import PurgeToken, purge_cavity
+from .ramp import RampRunner
 from .sequence import close_steam, open_steam
 from .setpoint import SetpointArbiter
 from .state import SteamPhase, SteamStateMachine
 from .trap import DrainTrap
 from .valve import SteamValve
-from .vent import VentToken, vent_pressure
+from .vent import SAFE_RESIDUAL_KPA, VentToken, vent_pressure
 
 STATE_KEY = "steam_state"
+RAMP_WRITER = "ramp_program"
+RAMP_PRIORITY = 80
+RAMP_BLEED_KPA_PER_S = 2.5
+RAMP_PROPORTIONAL_GAIN = 0.12
+# 与 SteamHeader.charge 的物理参数保持一致：每周期增益=流量*dt*0.012，
+# 散热损失=0.35 kPa/s。前馈开度按"在目标压力下平衡散热所需开度"折算。
+RAMP_CHARGE_GAIN_PER_FLOW = 0.012
+RAMP_LOSS_KPA_PER_S = 0.35
 
 
 class SteamUnit:
@@ -54,6 +65,9 @@ class SteamUnit:
         )
         self._purge_token: PurgeToken | None = None
         self._vent_token: VentToken | None = None
+        self._ramp: RampRunner | None = None
+        self._ramp_stage = -1
+        self._ramp_phase = ""
         self._lock = threading.RLock()
 
     @property
@@ -129,24 +143,117 @@ class SteamUnit:
 
         self.arbiter.request(writer, target_kpa, priority, reason=f"writer={writer}")
 
+    def start_ramp(self, profile: RampProfile) -> dict:
+        """按制品分段配方启动升温：校验各段目标可达后从第一段开始。"""
+
+        for stage in profile.stages:
+            clamped = self.limits.clamp_pressure(stage.target_kpa)
+            if abs(clamped - stage.target_kpa) > 1e-6:
+                raise SteamError(
+                    f"制品 {profile.product_code} 的分段目标 {stage.target_kpa} kPa "
+                    f"超出母管允许窗口 ({self.limits.min_pressure_kpa}, "
+                    f"{self.limits.max_pressure_kpa})",
+                    component="steam",
+                )
+        runner = RampRunner(
+            profile=profile,
+            clock=self.clock,
+            bus=self._bus,
+            floor_kpa=self.limits.min_pressure_kpa,
+            writer=RAMP_WRITER,
+        )
+        runner.start()
+        with self._lock:
+            self._ramp = runner
+            self._ramp_stage = -1
+            self._ramp_phase = ""
+        self._bus.publish(
+            Event.of(
+                "steam",
+                "steam",
+                "ramp_started",
+                subject=RAMP_WRITER,
+                product_code=profile.product_code,
+                stages=len(profile.stages),
+            )
+        )
+        return runner.snapshot()
+
+    def ramp(self) -> RampRunner | None:
+        with self._lock:
+            return self._ramp
+
+    def stop_ramp(self) -> None:
+        """中止分段升温（停汽/检修时调用）。"""
+
+        with self._lock:
+            self._ramp = None
+            self._ramp_stage = -1
+            self._ramp_phase = ""
+
+    def ramp_status(self) -> dict:
+        """分段升温状态；未启动时给出空态。"""
+
+        runner = self.ramp()
+        if runner is None:
+            return {"active": False}
+        return runner.snapshot()
+
     def advance(self, dt: float) -> dict:
         """推进一个控制周期：结算目标值、调节阀位、母管充压。"""
 
-        outcome = self.arbiter.resolve()
-        if self.valve.opening_pct <= 0.0 and self._state.phase is SteamPhase.HEATING:
-            opening = self.opening_for_target(outcome.target_kpa)
-            self.valve.set_opening(opening)
-        bias = self.regulator.update(self.header.pressure_kpa, outcome.target_kpa, dt)
-        if self._state.phase in (SteamPhase.HEATING, SteamPhase.HOLDING):
-            self.valve.set_opening(self.valve.opening_pct + bias * 0.05)
-        pressure = self.header.charge(self.valve.flow_kg_h(), dt)
-        return {
-            "winner": outcome.winner,
-            "target_kpa": round(outcome.target_kpa, 3),
-            "pressure_kpa": round(pressure, 3),
-            "valve_opening_pct": round(self.valve.opening_pct, 2),
-            "trap_opening_pct": round(self.trap.opening_pct, 2),
-        }
+        runner = self.ramp()
+        with self._lock:
+            ramp_summary: dict | None = None
+            if runner is not None:
+                ramp_summary = runner.update(self.header.pressure_kpa, self.clock.now())
+                self.arbiter.request(
+                    RAMP_WRITER,
+                    ramp_summary["command_kpa"],
+                    RAMP_PRIORITY,
+                    reason=f"ramp={ramp_summary['phase']}",
+                )
+            outcome = self.arbiter.resolve()
+            if runner is not None:
+                # 分段升温用纯比例阀控：前馈开度抵消散热损失，再按实测偏差修正；
+                # 换段或退回瞬间清掉旧积分，退回段小幅放压，让压力退回设定值，
+                # 避免在容差带两侧来回甩。
+                if (
+                    runner.stage_index != self._ramp_stage
+                    or runner.phase.value != self._ramp_phase
+                ):
+                    self.regulator.reset()
+                    self._ramp_stage = runner.stage_index
+                    self._ramp_phase = runner.phase.value
+                error_kpa = outcome.target_kpa - self.header.pressure_kpa
+                # 前馈开度按"平衡散热所需开度"折算（母管模型按额定流量计增益），
+                # 再叠加比例修正；否则按 0~100 的开度前馈会被当成满开进汽。
+                rated_pressure_rate = (
+                    self.limits.valve_rated_flow_kg_h * RAMP_CHARGE_GAIN_PER_FLOW
+                )
+                opening = 100.0 * RAMP_LOSS_KPA_PER_S / rated_pressure_rate
+                opening += RAMP_PROPORTIONAL_GAIN * error_kpa
+                self.valve.set_opening(max(0.0, min(100.0, opening)))
+                if ramp_summary["phase"] == "retreating":
+                    self.header.bleed(dt, RAMP_BLEED_KPA_PER_S)
+                pressure = self.header.charge(self.valve.flow_kg_h(), dt)
+                ramp_summary["pressure_kpa"] = round(pressure, 3)
+            else:
+                if self.valve.opening_pct <= 0.0 and self._state.phase is SteamPhase.HEATING:
+                    opening = self.opening_for_target(outcome.target_kpa)
+                    self.valve.set_opening(opening)
+                bias = self.regulator.update(self.header.pressure_kpa, outcome.target_kpa, dt)
+                if self._state.phase in (SteamPhase.HEATING, SteamPhase.HOLDING):
+                    self.valve.set_opening(self.valve.opening_pct + bias * 0.05)
+                pressure = self.header.charge(self.valve.flow_kg_h(), dt)
+            return {
+                "winner": outcome.winner,
+                "target_kpa": round(outcome.target_kpa, 3),
+                "pressure_kpa": round(pressure, 3),
+                "valve_opening_pct": round(self.valve.opening_pct, 2),
+                "trap_opening_pct": round(self.trap.opening_pct, 2),
+                "ramp": ramp_summary,
+            }
 
     def persist_state(self) -> str:
         """把相位与压力落盘，返回内容摘要。"""
@@ -185,4 +292,5 @@ class SteamUnit:
                 "regulator": self.regulator.snapshot(),
                 "purged": self.is_purged(),
                 "vented": self.is_vented(),
+                "ramp": self.ramp_status(),
             }

@@ -68,6 +68,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     platform.reset_state()
 
     cure = platform.run_cure("demo-mold", cavity_count=4)
+    ramp = platform.drive_ramp("press-01") if args.fast else platform.run_ramp("press-01")
     cycles = [
         platform.cycle(
             CycleInputs(
@@ -93,6 +94,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
 
     report = {
         "cure": cure,
+        "ramp": ramp,
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
         "setpoint_probe": setpoint_probe,

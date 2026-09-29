@@ -41,6 +41,36 @@ limits:
     dispatch_window_s: 180.0
     max_queue: 12
 
+# 按制品型号给出的分段升温（升压）配方：每段到点后在容差带内停够 hold_s
+# 才进下一段；中途冲过 target + tolerance 自动退回本段下沿，重新到点、重新
+# 计时。最后一段到点后交由硫化计时保温，hold_s 置 0。
+ramps:
+  RB-215:
+    stages:
+      - target_pressure_kpa: 320.0
+        hold_s: 60.0
+        tolerance_kpa: 24.0
+      - target_pressure_kpa: 480.0
+        hold_s: 90.0
+        tolerance_kpa: 24.0
+      - target_pressure_kpa: 640.0
+        hold_s: 0.0
+        tolerance_kpa: 24.0
+  RB-330:
+    stages:
+      - target_pressure_kpa: 280.0
+        hold_s: 90.0
+        tolerance_kpa: 24.0
+      - target_pressure_kpa: 420.0
+        hold_s: 120.0
+        tolerance_kpa: 24.0
+      - target_pressure_kpa: 560.0
+        hold_s: 120.0
+        tolerance_kpa: 24.0
+      - target_pressure_kpa: 680.0
+        hold_s: 0.0
+        tolerance_kpa: 24.0
+
 pages:
   - press
   - steam

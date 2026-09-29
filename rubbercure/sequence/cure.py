@@ -19,6 +19,7 @@ from ..mold.mapping import SensorMapBook
 from ..mold.registry import MoldRegistry
 from ..press.press import CuringPress
 from ..press.transitions import PressPhase
+from ..steam.profile import RampProfileBook
 from ..temp.read import read_mold_temp
 from ..timer.curve import CurveBook
 from ..timer.start import start_cure
@@ -68,6 +69,7 @@ class CureSequence:
     maps: SensorMapBook
     curves: CurveBook
     press: CuringPress
+    ramps: RampProfileBook | None = None
     last_confirmation: dict = field(default_factory=dict)
     recorder: SequenceRecorder = field(init=False)
 
@@ -118,6 +120,9 @@ class CureSequence:
 
         press.transition(PressPhase.HEATING)
         steam = press.steam.open_steam(plan.target_kpa)
+        if self.ramps is not None and self.ramps.has(plan.product_code):
+            # 按制品的分段配方接管升温：每段到点停够再进下一段，冲过头退回。
+            press.steam.start_ramp(self.ramps.resolve(plan.product_code))
         self.recorder.note(
             "steam_open",
             "steam",
@@ -174,6 +179,7 @@ class CureSequence:
             "violations": verify_order(self.recorder.names(), CURE_ORDER),
             "trace": self.recorder.as_list(),
             "warmup": warmup,
+            "ramp": self.press.steam.ramp_status(),
             "timer": self.press.timer.snapshot(),
         }
 

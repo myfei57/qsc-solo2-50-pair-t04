@@ -32,6 +32,7 @@ from .sequence.dispatch import DispatchSequence
 from .sequence.openmold import OpenSequence
 from .sequence.selfcheck import verify_topology
 from .sequence.stop import StopSequence
+from .steam.profile import RampProfile, RampProfileBook, RampStage
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
 from .telemetry import TrendBuffer
@@ -84,6 +85,7 @@ class Platform:
         self.registry = MoldRegistry()
         self.maps = SensorMapBook()
         self.curves = CurveBook()
+        self.ramp_book = self._build_ramp_book()
         self.latch = CureLatch()
         self.fleet = PressFleet.from_config(
             self.clock, self.bus, self.store.root, self.config
@@ -103,6 +105,34 @@ class Platform:
             self.config.timer.default_nominal_s,
             self.clock.now(),
         )
+
+    def _build_ramp_book(self) -> RampProfileBook:
+        """把配置里的分段升温配方装成注册册，并校验默认制品必须有配方。"""
+
+        book = RampProfileBook()
+        for configured in self.config.ramps:
+            book.register_stages(
+                configured.product_code,
+                [
+                    RampStage(
+                        target_kpa=stage.target_pressure_kpa,
+                        hold_s=stage.hold_s,
+                        tolerance_kpa=stage.tolerance_kpa,
+                    )
+                    for stage in configured.stages
+                ],
+            )
+        if not book.has(self.config.press.default_product_code):
+            raise RubberCureError(
+                f"默认制品 {self.config.press.default_product_code} 缺少分段升温配方",
+                component="config",
+            )
+        return book
+
+    def ramp_profile(self, product_code: str) -> RampProfile:
+        """解析一个制品的分段升温配方。"""
+
+        return self.ramp_book.resolve(product_code)
 
     def _register_namespaces(self) -> None:
         """登记现场设备命名空间（控制台与审计共用同一套名字）。"""
@@ -244,10 +274,106 @@ class Platform:
                 maps=self.maps,
                 curves=self.curves,
                 press=self.press(press_id),
+                ramps=self.ramp_book,
             )
             report = sequence.run(plan)
             report["topology_missing"] = sequence.verify_topology(self.topology)
             return report
+
+    def run_ramp(
+        self,
+        press_id: str,
+        product_code: str | None = None,
+        target_kpa: float | None = None,
+    ) -> dict:
+        """在一台已通汽的硫化机上按制品配方启动分段升温。"""
+
+        code = product_code or self.config.press.default_product_code
+        profile = self.ramp_profile(code)
+        unit = self.press(press_id)
+        started = unit.steam.start_ramp(profile)
+        return {
+            "press_id": press_id,
+            "product_code": code,
+            "ramp": started,
+            "target_kpa": target_kpa if target_kpa is not None else profile.final_target_kpa,
+        }
+
+    def drive_ramp(
+        self,
+        press_id: str,
+        step_s: float = 1.0,
+        max_steps: int = 20_000,
+    ) -> dict:
+        """按控制周期把分段升温驱到走完，返回各段到点/退回轨迹。
+
+        验证环境用 :class:`ManualClock` 时不真实等待；现场挂在控制循环里时
+        每周期调用一次 ``steam.advance`` 即可，本方法只是把同样的推进跑完整条
+        曲线并留下审计轨迹。
+        """
+
+        if step_s <= 0:
+            raise ValueError("驱控步长必须为正")
+        unit = self.press(press_id)
+        runner = unit.steam.ramp()
+        if runner is None:
+            raise RubberCureError(
+                f"硫化机 {press_id} 尚未启动分段升温", component="steam"
+            )
+        milestones: list[dict] = []
+        reached: set[int] = set()
+        steps = 0
+        while runner.is_running() and steps < max_steps:
+            before_phase = runner.phase.value
+            before_stage = runner.stage_index
+            result = unit.steam.advance(step_s)
+            unit.clock.sleep(step_s)
+            ramp = result["ramp"]
+            steps += 1
+            if ramp["phase"] != before_phase or ramp["stage_index"] != before_stage:
+                milestones.append(
+                    {
+                        "step": steps,
+                        "phase": ramp["phase"],
+                        "stage_index": ramp["stage_index"],
+                        "pressure_kpa": ramp["pressure_kpa"],
+                        "retreats": ramp["retreats"],
+                    }
+                )
+                if ramp["phase"] == "complete":
+                    # 末段 hold_s=0 时到点与完成在同一周期，补一条到点轨迹。
+                    milestones.append(
+                        {
+                            "step": steps,
+                            "phase": "reached",
+                            "stage_index": ramp["stage_index"],
+                            "pressure_kpa": ramp["pressure_kpa"],
+                            "retreats": ramp["retreats"],
+                        }
+                    )
+            if ramp["phase"] == "holding" and ramp["stage_index"] not in reached:
+                reached.add(ramp["stage_index"])
+                milestones.append(
+                    {
+                        "step": steps,
+                        "phase": "reached",
+                        "stage_index": ramp["stage_index"],
+                        "pressure_kpa": ramp["pressure_kpa"],
+                        "retreats": ramp["retreats"],
+                    }
+                )
+        return {
+            "press_id": press_id,
+            "product_code": runner.profile.product_code,
+            "steps": steps,
+            "completed": runner.is_done(),
+            "final_phase": runner.phase.value,
+            "final_stage": runner.stage_index,
+            "pressure_kpa": round(unit.steam.pressure_kpa, 3),
+            "retreats": runner.retreats,
+            "milestones": milestones,
+            "ramp": unit.steam.ramp_status(),
+        }
 
     def run_open(self, press_id: str = DEFAULT_PRESS_ID) -> dict:
         """在一台硫化机上跑完整的开模顺序。"""
@@ -456,6 +582,8 @@ class Platform:
             "molds": summarize_molds(self.registry),
             "sensor_maps": self.maps.snapshot(),
             "curves": self.curves.snapshot(),
+            "ramps": self.ramp_book.snapshot(),
+            "ramp_products": self.ramp_book.known_products(),
             "latch": self.latch.snapshot(),
             "fleet": summarize_fleet(self.fleet),
             "scheduler": self.scheduler.snapshot(),
@@ -543,6 +671,7 @@ def build_platform(
             timer=effective.timer,
             cool=effective.cool,
             batch=effective.batch,
+            ramps=effective.ramps,
             pages=effective.pages,
         )
     return Platform(config=effective, clock=clock, unit=unit)

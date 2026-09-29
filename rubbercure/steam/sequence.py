@@ -46,6 +46,7 @@ def open_steam(unit: "SteamUnit", bus: EventBus, target_kpa: float) -> dict:
 def close_steam(unit: "SteamUnit", bus: EventBus) -> dict:
     """按"先关蒸汽、后关疏水"的顺序停汽，返回停汽结果。"""
 
+    unit.stop_ramp()
     valve_opening = unit.close_valve()
     trap_opening = unit.trap.close()
     result = {

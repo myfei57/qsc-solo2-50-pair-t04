@@ -53,3 +53,7 @@ class MoldError(RubberCureError):
 
 class CureError(RubberCureError):
     """硫化计时状态非法。"""
+
+
+class SteamError(RubberCureError):
+    """蒸汽分段升温配方或执行状态非法。"""

@@ -278,6 +278,60 @@ class BatchLimits:
 
 
 @dataclass(frozen=True)
+class RampStageConfig:
+    """分段升温配方中的一段（配置形态）。"""
+
+    target_pressure_kpa: float
+    hold_s: float
+    tolerance_kpa: float
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "RampStageConfig":
+        return cls(
+            target_pressure_kpa=_number(section, "target_pressure_kpa", minimum=0.0),
+            hold_s=_number(section, "hold_s", minimum=0.0),
+            tolerance_kpa=_number(section, "tolerance_kpa", minimum=0.0),
+        )
+
+    def as_dict(self) -> dict:
+        return {
+            "target_pressure_kpa": self.target_pressure_kpa,
+            "hold_s": self.hold_s,
+            "tolerance_kpa": self.tolerance_kpa,
+        }
+
+
+@dataclass(frozen=True)
+class ProductRampConfig:
+    """一个制品型号的分段升温配方（配置形态）。"""
+
+    product_code: str
+    stages: tuple[RampStageConfig, ...]
+
+    @classmethod
+    def from_mapping(cls, product_code: str, section: Mapping[str, Any]) -> "ProductRampConfig":
+        raw_stages = section.get("stages", _MISSING)
+        if raw_stages is _MISSING:
+            raise ConfigError(f"制品 {product_code} 的升温配方缺少字段 'stages'", component="config")
+        if not isinstance(raw_stages, list) or not raw_stages:
+            raise ConfigError(f"制品 {product_code} 的 'stages' 必须是非空列表", component="config")
+        stages = tuple(RampStageConfig.from_mapping(item) for item in raw_stages)
+        for index in range(1, len(stages)):
+            if stages[index].target_pressure_kpa <= stages[index - 1].target_pressure_kpa:
+                raise ConfigError(
+                    f"制品 {product_code} 的分段目标压力必须严格递增（第 {index + 1} 段）",
+                    component="config",
+                )
+        return cls(product_code=product_code, stages=stages)
+
+    def as_dict(self) -> dict:
+        return {
+            "product_code": self.product_code,
+            "stages": [stage.as_dict() for stage in self.stages],
+        }
+
+
+@dataclass(frozen=True)
 class PlatformConfig:
     """一份完整的平台配置。"""
 
@@ -291,6 +345,7 @@ class PlatformConfig:
     timer: TimerLimits
     cool: CoolLimits
     batch: BatchLimits
+    ramps: tuple[ProductRampConfig, ...] = field(default_factory=tuple)
     pages: tuple[str, ...] = field(default_factory=tuple)
 
     @classmethod
@@ -314,17 +369,37 @@ class PlatformConfig:
             if not isinstance(page, str) or not page.strip():
                 raise ConfigError("pages 中的页面名必须是非空字符串", component="config")
 
+        steam_limits = SteamLimits.from_mapping(_section(limits, "steam"))
+        ramps_raw = mapping.get("ramps", {})
+        if ramps_raw is None:
+            ramps_raw = {}
+        if not isinstance(ramps_raw, Mapping):
+            raise ConfigError("ramps 必须是按制品型号组织的映射", component="config")
+        ramps = tuple(
+            ProductRampConfig.from_mapping(product_code, section)
+            for product_code, section in ramps_raw.items()
+        )
+        for ramp in ramps:
+            for stage in ramp.stages:
+                if not steam_limits.min_pressure_kpa < stage.target_pressure_kpa < steam_limits.max_pressure_kpa:
+                    raise ConfigError(
+                        f"制品 {ramp.product_code} 的分段目标 {stage.target_pressure_kpa} kPa "
+                        "超出蒸汽压力允许窗口",
+                        component="config",
+                    )
+
         return cls(
             name=name,
             project_id=project_id,
             storage_root=storage_root,
             mold=MoldLimits.from_mapping(_section(limits, "mold")),
             press=PressLimits.from_mapping(_section(limits, "press")),
-            steam=SteamLimits.from_mapping(_section(limits, "steam")),
+            steam=steam_limits,
             temp=TempLimits.from_mapping(_section(limits, "temp")),
             timer=TimerLimits.from_mapping(_section(limits, "timer")),
             cool=CoolLimits.from_mapping(_section(limits, "cool")),
             batch=BatchLimits.from_mapping(_section(limits, "batch")),
+            ramps=ramps,
             pages=tuple(pages),
         )
 
@@ -379,6 +454,25 @@ def default_config() -> PlatformConfig:
             drain_hold_s=30.0,
         ),
         batch=BatchLimits(dispatch_window_s=180.0, max_queue=12),
+        ramps=(
+            ProductRampConfig(
+                product_code="RB-215",
+                stages=(
+                    RampStageConfig(target_pressure_kpa=320.0, hold_s=60.0, tolerance_kpa=24.0),
+                    RampStageConfig(target_pressure_kpa=480.0, hold_s=90.0, tolerance_kpa=24.0),
+                    RampStageConfig(target_pressure_kpa=640.0, hold_s=0.0, tolerance_kpa=24.0),
+                ),
+            ),
+            ProductRampConfig(
+                product_code="RB-330",
+                stages=(
+                    RampStageConfig(target_pressure_kpa=280.0, hold_s=90.0, tolerance_kpa=24.0),
+                    RampStageConfig(target_pressure_kpa=420.0, hold_s=120.0, tolerance_kpa=24.0),
+                    RampStageConfig(target_pressure_kpa=560.0, hold_s=120.0, tolerance_kpa=24.0),
+                    RampStageConfig(target_pressure_kpa=680.0, hold_s=0.0, tolerance_kpa=24.0),
+                ),
+            ),
+        ),
         pages=("press", "steam", "timer", "alarms"),
     )
 
@@ -400,6 +494,10 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
             "timer": cfg.timer.as_dict(),
             "cool": cfg.cool.as_dict(),
             "batch": cfg.batch.as_dict(),
+        },
+        "ramps": {
+            ramp.product_code: {"stages": [stage.as_dict() for stage in ramp.stages]}
+            for ramp in cfg.ramps
         },
         "pages": list(cfg.pages),
     }
